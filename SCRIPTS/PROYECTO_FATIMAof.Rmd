@@ -1,0 +1,403 @@
+---
+title: "Proyecto Final - Análisis Exploratorio del Tipo de cambio interbancario en el año 2020"
+subtitle: "Indicadores Macroeconómicos del Perú (BCRP)"
+author: "Fátima Aliaga Carbajal"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+## 1. Contexto del conjunto de datos
+
+**Institución que proporciona los datos:** 
+Banco Central de Reserva del Perú (BCRP), a través de su sistema de series estadísticas (BCRPData).
+
+**Objetivo/temática del conjunto de datos:**
+El conjunto de datos permite monitorear la evolución mensual de tres indicadores macroeconómicos clave de la economía peruana: el tipo de cambio, el nivel de precios (a través del cual se calcula la inflación) y la tasa de interés de referencia que fija el BCRP como principal instrumento de política monetaria. Estas tres variables están estrechamente relacionadas por el llamado mecanismo de transmisión de la política monetaria: el BCRP ajusta la tasa de referencia buscando controlar la inflación, y ambas variables influyen a su vez sobre el tipo de cambio (por ejemplo, mediante diferenciales de tasas de interés que afectan los flujos de capital).
+
+**Principales variables analizadas:**
+
+| Variable | Descripción | Código BCRP | Tipo |
+|---|---|---|---|
+| `fecha` | Periodo mensual | — | Temporal |
+| `tc` | Tipo de cambio interbancario promedio (S/ por US$) | PN01207PM | Numérica continua |
+| `ipc` | Índice de Precios al Consumidor (Dic.2009 = 100) | PN01270PM | Numérica continua |
+| `tr` | Tasa de Referencia de la Política Monetaria (%) | PD04722MM | Numérica continua |
+| `inflacion_mensual` | Variable creada: variación % mensual del IPC | — | Numérica continua (derivada) |
+
+Desde la teoría económica, se espera una relación de **causalidad en ambas direcciones (endogeneidad)** entre `tr` e `inflacion_mensual`: el BCRP sube la tasa de referencia como respuesta a una inflación alta o a expectativas inflacionarias al alza (regla tipo Taylor), pero al mismo tiempo esa subida busca *reducir* la inflación futura con rezago. Este punto se retoma en las conclusiones.
+
+## 2. Importación de datos
+
+Los datos fueron descargados previamente desde el portal de series estadísticas del BCRP (BCRPData) y guardados en formato Excel. A continuación se importan a R con el paquete.
+
+```{r librerias}
+paquetes <- c("tidyverse", "janitor", "skimr", "scales", "patchwork",
+              "lubridate", "readxl", "moments", "tseries")
+instalar <- paquetes[!(paquetes %in% installed.packages()[, "Package"])]
+if (length(instalar) > 0) install.packages(instalar)
+
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(scales)
+library(patchwork)
+library(lubridate)
+library(readxl)
+library(moments)   # asimetría y curtosis
+library(tseries)   # prueba de raíz unitaria (Dickey-Fuller aumentada)
+```
+
+```{r importacion}
+# Ajustar la ruta al archivo según la ubicación del archivo en su equipo
+datos <- read_xlsx("C:/Users/FATIMA/OneDrive/Documentos/CURSOS/OFIMATICA/datosbcrp.xlsx")
+
+glimpse(datos)
+```
+
+## 3. Limpieza y preparación
+
+### 3.1 Estandarizar nombres de columnas
+
+```{r limpieza_nombres}
+datos <- datos %>%
+  clean_names()
+
+names(datos)
+```
+
+### 3.2 Cambio de nombres de variables
+
+Se renombran las columnas a nombres cortos y claros para facilitar el análisis.
+
+```{r renombrar}
+datos <- datos %>%
+  rename(
+    fecha = fecha,
+    tc    = tcip,
+    ipc   = ipc,
+    tr    = trpm
+  )
+
+head(datos$fecha, 12)
+```
+
+### 3.3 Transformación de la fecha
+
+El campo `fecha` llega como texto en formato abreviado en español (por ejemplo, "Ene.20"), por lo que se convierte a una fecha real de tipo `Date`.
+
+```{r fecha}
+meses_es <- c("Ene" = "01", "Feb" = "02", "Mar" = "03", "Abr" = "04",
+              "May" = "05", "Jun" = "06", "Jul" = "07", "Ago" = "08",
+              "Set" = "09", "Sep" = "09", "Oct" = "10", "Nov" = "11", "Dic" = "12")
+
+datos <- datos %>%
+  mutate(
+    mes_abrev = str_sub(fecha, 1, 3),
+    anio      = paste0("20", str_sub(fecha, 4, 5)),
+    mes_num   = meses_es[mes_abrev],
+    fecha     = ymd(paste(anio, mes_num, "01", sep = "-")),
+    tc        = as.numeric(tc),
+    ipc       = as.numeric(ipc),
+    tr        = as.numeric(tr)
+  ) %>%
+  select(-mes_abrev, -anio, -mes_num) %>%
+  arrange(fecha)
+
+head(datos$fecha, 12)
+```
+
+### 3.4 Creación de nuevas variables
+
+Además de la inflación mensual, se crean variables adicionales de interés económico: la inflación interanual (variación del IPC respecto al mismo mes del año anterior) y el spread real (tasa de referencia menos inflación interanual), que aproxima la tasa de interés real de política.
+
+```{r nuevas_variables}
+datos <- datos %>%
+  mutate(
+    inflacion_mensual   = (ipc / lag(ipc) - 1) * 100,
+    inflacion_interanual = (ipc / lag(ipc, 12) - 1) * 100,
+    tasa_real_aprox     = tr - inflacion_interanual
+  )
+```
+
+### 3.5 Filtrado de observaciones incompletas
+
+```{r filtrado}
+datos <- datos %>%
+  filter(!is.na(tc), !is.na(ipc), !is.na(tr))
+```
+
+### 3.6 Variable de agrupación: año
+
+```{r agrupacion}
+datos <- datos %>%
+  mutate(anio = year(fecha))
+```
+
+## 4. Estadísticas descriptivas
+
+### 4.1 Resumen general
+
+```{r resumen}
+skim(datos %>% select(tc, ipc, tr, inflacion_mensual, inflacion_interanual))
+```
+
+### 4.2 Estadísticos descriptivos por variable (nivel económico)
+
+Para un análisis a nivel de economía no basta con la media: interesa también la **dispersión relativa** (coeficiente de variación), la **asimetría** (si la distribución tiene colas más largas hacia valores altos o bajos) y la **curtosis** (si hay valores extremos con mayor frecuencia que en una distribución normal, algo común en series financieras y cambiarias).
+
+```{r estadisticos_avanzados}
+tabla_estadisticos <- datos %>%
+  select(tc, ipc, tr, inflacion_mensual) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "valor") %>%
+  filter(!is.na(valor)) %>%
+  group_by(variable) %>%
+  summarise(
+    media       = mean(valor),
+    mediana     = median(valor),
+    desv_est    = sd(valor),
+    cv_pct      = (sd(valor) / mean(valor)) * 100,
+    minimo      = min(valor),
+    maximo      = max(valor),
+    asimetria   = skewness(valor),
+    curtosis    = kurtosis(valor)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+tabla_estadisticos
+```
+
+**Interpretación:** un coeficiente de variación (CV) alto indica que la variable presenta una dispersión relativa importante respecto a su media, lo cual es esperable en `tr` e `inflacion_mensual` durante periodos de choques económicos (por ejemplo, la pandemia o episodios de alta incertidumbre política). Una asimetría distinta de cero sugiere que la distribución no es simétrica: valores positivos indican una cola más larga hacia la derecha (meses puntuales de inflación o tasas inusualmente altas), mientras que una curtosis superior a 3 (exceso de curtosis positivo) indica una distribución leptocúrtica, es decir, con más valores extremos ("colas pesadas") de lo que predeciría una distribución normal — un rasgo típico de las series financieras y cambiarias.
+
+### 4.3 Promedios y volatilidad anual
+
+```{r promedios_anuales}
+tabla_anual <- datos %>%
+  group_by(anio) %>%
+  summarise(
+    tc_prom      = mean(tc, na.rm = TRUE),
+    tc_sd        = sd(tc, na.rm = TRUE),
+    inflacion_prom = mean(inflacion_mensual, na.rm = TRUE),
+    tr_prom      = mean(tr, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+tabla_anual
+```
+
+**Interpretación:** la desviación estándar anual del tipo de cambio funciona como un indicador aproximado de volatilidad cambiaria dentro de cada año: valores más altos señalan años con mayor incertidumbre o mayores choques externos/internos sobre el sol peruano.
+
+### 4.4 Matriz de correlación
+
+```{r correlacion}
+matriz_cor <- datos %>%
+  select(tc, ipc, tr, inflacion_mensual) %>%
+  cor(use = "complete.obs") %>%
+  round(2)
+
+matriz_cor
+```
+
+```{r correlacion_valores, include=FALSE}
+cor_tr_infl <- cor(datos$tr, datos$inflacion_mensual, use = "complete.obs")
+cor_tc_ipc  <- cor(datos$tc, datos$ipc, use = "complete.obs")
+cor_tc_tr   <- cor(datos$tc, datos$tr, use = "complete.obs")
+fecha_min   <- format(min(datos$fecha), "%B %Y")
+fecha_max   <- format(max(datos$fecha), "%B %Y")
+tc_prom_gen <- round(mean(datos$tc, na.rm = TRUE), 2)
+tr_prom_gen <- round(mean(datos$tr, na.rm = TRUE), 2)
+infl_prom_gen <- round(mean(datos$inflacion_mensual, na.rm = TRUE), 2)
+tc_cv       <- round(sd(datos$tc, na.rm = TRUE) / mean(datos$tc, na.rm = TRUE) * 100, 2)
+```
+
+**Interpretación:** el periodo analizado va de `r fecha_min` a `r fecha_max`. En promedio, el tipo de cambio se ubicó en S/ `r tc_prom_gen` por dólar (CV = `r tc_cv`%) y la tasa de referencia en `r tr_prom_gen`%, con una inflación mensual promedio de `r infl_prom_gen`%. La correlación entre la tasa de referencia y la inflación mensual es de `r round(cor_tr_infl, 2)`, una relación `r ifelse(cor_tr_infl > 0, "positiva", "negativa")` y `r ifelse(abs(cor_tr_infl) >= 0.5, "moderada a fuerte", ifelse(abs(cor_tr_infl) >= 0.2, "débil a moderada", "muy débil"))`. El tipo de cambio y el IPC muestran una correlación de `r round(cor_tc_ipc, 2)`, y el tipo de cambio con la tasa de referencia, de `r round(cor_tc_tr, 2)`.
+
+### 4.5 Prueba de raíz unitaria (Dickey-Fuller aumentada)
+
+En series de tiempo económicas es relevante evaluar si una variable es **estacionaria** (fluctúa alrededor de una media constante) o si sigue un **camino aleatorio** (no estacionaria), ya que esto condiciona qué modelos econométricos son válidos para analizarla.
+
+```{r adf_test}
+adf_tc <- tryCatch(adf.test(na.omit(datos$tc)), error = function(e) NULL)
+adf_infl <- tryCatch(adf.test(na.omit(datos$inflacion_mensual)), error = function(e) NULL)
+
+adf_tc
+adf_infl
+```
+
+**Interpretación:** si el p-valor de la prueba ADF es mayor a 0.05 para `tc`, no se rechaza la hipótesis nula de raíz unitaria, es decir, el tipo de cambio se comportaría como una **serie no estacionaria** (típico en variables financieras y cambiarias, que suelen seguir un camino aleatorio). Si el p-valor para `inflacion_mensual` es menor a 0.05, se rechaza la hipótesis nula y la inflación mensual sería **estacionaria**, lo cual es consistente con una variable que fluctúa alrededor de una meta de inflación bajo un esquema de metas explícitas de inflación (como el que aplica el BCRP).
+
+## 5. Visualización de datos
+
+### 5.1 Evolución del tipo de cambio en el tiempo
+
+```{r grafico1}
+g1 <- datos %>%
+  ggplot(aes(x = fecha, y = tc)) +
+  geom_line(color = "#2c3e50", linewidth = 0.8) +
+  labs(
+    title    = "Evolución del tipo de cambio interbancario (S/ por US$)",
+    subtitle = paste0("Perú, ", fecha_min, " - ", fecha_max),
+    x        = "Fecha",
+    y        = "Tipo de cambio (S/ por US$)",
+    caption  = "Fuente: BCRP - BCRPData (serie PN01207PM)"
+  ) +
+  theme_minimal(base_size = 12)
+
+g1
+```
+
+**Interpretación:** el tipo de cambio promedió S/ `r tc_prom_gen` por dólar durante el periodo analizado, con un coeficiente de variación de `r tc_cv`%. La línea permite identificar los episodios de apreciación (tramos descendentes) y depreciación (tramos ascendentes) del sol, que suelen coincidir con periodos de incertidumbre política interna, cambios en la tasa de referencia de la Reserva Federal de EE. UU., o choques en los precios de materias primas que exporta el Perú (efecto términos de intercambio).
+
+### 5.2 Evolución conjunta de las tres variables (índice base 100)
+
+Para comparar la trayectoria relativa de variables con unidades distintas (soles, índice de precios y porcentaje), se construye un índice con base 100 en el primer periodo de la muestra.
+
+```{r grafico2}
+datos_indexado <- datos %>%
+  arrange(fecha) %>%
+  mutate(
+    tc_idx = tc / first(tc) * 100,
+    ipc_idx = ipc / first(ipc) * 100,
+    tr_idx = tr / first(tr) * 100
+  ) %>%
+  select(fecha, tc_idx, ipc_idx, tr_idx) %>%
+  pivot_longer(-fecha, names_to = "variable", values_to = "indice") %>%
+  mutate(variable = recode(variable,
+    tc_idx  = "Tipo de cambio",
+    ipc_idx = "IPC",
+    tr_idx  = "Tasa de referencia"
+  ))
+
+g2 <- datos_indexado %>%
+  ggplot(aes(x = fecha, y = indice, color = variable)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title    = "Trayectoria comparada de los indicadores macroeconómicos",
+    subtitle = paste0("Índice base 100 = ", fecha_min),
+    x        = "Fecha",
+    y        = "Índice (base 100)",
+    color    = "Indicador",
+    caption  = "Fuente: BCRP - BCRPData. Elaboración propia."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+g2
+```
+
+**Interpretación:** al llevar las tres series a una base común (100 en el primer mes de la muestra), es posible comparar su crecimiento relativo. Si la línea del IPC crece de forma sostenida mientras la tasa de referencia se mueve en escalones, se observa cómo el BCRP reacciona ante la acumulación de inflación ajustando su instrumento de política. Si el índice del tipo de cambio se mueve de forma más errática que el IPC, ello es consistente con el resultado de la prueba ADF: el tipo de cambio está más influido por factores externos y de mercado (no estacionario) que por la dinámica interna de precios.
+
+### 5.3 Relación entre la tasa de referencia y la inflación mensual
+
+```{r grafico3}
+g3 <- datos %>%
+  filter(!is.na(inflacion_mensual)) %>%
+  ggplot(aes(x = tr, y = inflacion_mensual)) +
+  geom_point(alpha = 0.6, color = "#c0392b") +
+  geom_smooth(method = "lm", se = TRUE, color = "#2c3e50") +
+  labs(
+    title    = "Relación entre la tasa de referencia y la inflación mensual",
+    subtitle = paste0("Perú, ", fecha_min, " - ", fecha_max),
+    x        = "Tasa de referencia de política monetaria (%)",
+    y        = "Inflación mensual (variación % del IPC)",
+    caption  = "Fuente: BCRP - BCRPData (series PD04722MM y PN01270PM)"
+  ) +
+  theme_minimal(base_size = 12)
+
+g3
+```
+
+**Interpretación:** el diagrama de dispersión, junto con la línea de tendencia ajustada, evidencia una correlación de `r round(cor_tr_infl, 2)` entre la tasa de referencia y la inflación mensual, es decir, una relación `r ifelse(cor_tr_infl > 0, "directa: cuando la tasa de referencia es más alta, la inflación mensual observada tiende a ser mayor", "inversa: cuando la tasa de referencia es más alta, la inflación mensual observada tiende a ser menor")`. Este resultado debe interpretarse con cautela desde la teoría económica: la relación contemporánea puede estar capturando la **endogeneidad de la política monetaria** (el BCRP sube la tasa *en respuesta* a una inflación alta), más que el efecto causal de la tasa sobre la inflación futura, el cual normalmente se manifiesta con rezago.
+
+### 5.4 Distribución de la inflación mensual
+
+```{r grafico4}
+g4 <- datos %>%
+  filter(!is.na(inflacion_mensual)) %>%
+  ggplot(aes(x = inflacion_mensual)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30,
+                 fill = "#2980b9", color = "white", alpha = 0.8) +
+  geom_density(color = "#c0392b", linewidth = 0.9) +
+  geom_vline(xintercept = infl_prom_gen, linetype = "dashed", color = "#2c3e50") +
+  labs(
+    title    = "Distribución de la inflación mensual",
+    subtitle = paste0("Perú, ", fecha_min, " - ", fecha_max, " (línea punteada = media)"),
+    x        = "Inflación mensual (%)",
+    y        = "Densidad",
+    caption  = "Fuente: BCRP - BCRPData (serie PN01270PM). Elaboración propia."
+  ) +
+  theme_minimal(base_size = 12)
+
+g4
+```
+
+**Interpretación:** la distribución de la inflación mensual tiene una asimetría de `r round(skewness(na.omit(datos$inflacion_mensual)), 2)` y una curtosis de `r round(kurtosis(na.omit(datos$inflacion_mensual)), 2)`. $inflacion_mensual > 3, "Al ser la curtosis mayor a 3, la distribución es leptocúrtica: existen meses con variaciones de precios inusualmente altas o bajas (colas pesadas) con mayor frecuencia que en una distribución normal, reflejo de choques puntuales de oferta (alimentos, combustibles) sobre el IPC.", "La curtosis cercana o menor a 3 sugiere una distribución sin colas particularmente pesadas, es decir, sin una frecuencia inusual de meses con inflación extrema.")`
+
+### 5.5 Dispersión del tipo de cambio por año
+
+```{r grafico5}
+g5 <- datos %>%
+  ggplot(aes(x = factor(anio), y = tc)) +
+  geom_boxplot(fill = "#7fb3d5", color = "#2c3e50", alpha = 0.8) +
+  labs(
+    title    = "Dispersión del tipo de cambio por año",
+    subtitle = "Perú - Diagrama de cajas",
+    x        = "Año",
+    y        = "Tipo de cambio (S/ por US$)",
+    caption  = "Fuente: BCRP - BCRPData (serie PN01207PM). Elaboración propia."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+g5
+```
+
+**Interpretación:** los años con cajas más altas y bigotes más largos reflejan una mayor volatilidad intra-anual del tipo de cambio, mientras que los años con cajas compactas indican un tipo de cambio más estable dentro del año. Comparar la mediana (línea dentro de la caja) entre años permite identificar tendencias de apreciación o depreciación sostenida del sol frente al dólar.
+
+### 5.6 Collage de gráficos principales
+
+```{r collage, fig.width=13, fig.height=9}
+collage <- (g1 | g3) / (g4 | g5) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Análisis Exploratorio de Datos (EDA)",
+    subtitle = paste0("Indicadores Macroeconómicos del Perú (BCRP, ", fecha_min, " - ", fecha_max, ")"),
+    caption = "Fuente: Elaboración propia con datos del BCRP",
+    theme = theme(
+      plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 13, hjust = 0.5),
+      plot.caption = element_text(size = 10, hjust = 1)
+    )
+  ) &
+  theme(
+    plot.title = element_text(size = 11, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    plot.margin = margin(8, 8, 8, 8)
+  )
+
+collage
+```
+
+```{r guardar_figuras, include=FALSE}
+if (!dir.exists("figures")) dir.create("figures")
+ggsave("figures/01_tc_tiempo.png", g1, width = 8, height = 5, dpi = 300)
+ggsave("figures/02_indices_comparados.png", g2, width = 9, height = 5, dpi = 300)
+ggsave("figures/03_tr_inflacion.png", g3, width = 8, height = 5, dpi = 300)
+ggsave("figures/04_distribucion_inflacion.png", g4, width = 8, height = 5, dpi = 300)
+ggsave("figures/05_boxplot_tc_anio.png", g5, width = 8, height = 5, dpi = 300)
+ggsave("figures/collage_graficos.png", collage, width = 13, height = 9, dpi = 300)
+```
+
+## 6. Conclusiones
+
+- El análisis exploratorio de los indicadores macroeconómicos del BCRP durante el periodo de estudio evidencia un tipo de cambio con una volatilidad moderada, comportándose como una serie no estacionaria según la prueba ADF, resultado esperable dada su exposición a factores externos como los flujos de capital, el precio de las materias primas y la incertidumbre política interna. Asimismo, se identificó una correlación positiva de magnitud moderada entre la tasa de referencia y la inflación mensual, hallazgo coherente con el esquema de metas explícitas de inflación que aplica el BCRP, aunque este resultado no debe interpretarse como una relación causal directa debido a la endogeneidad propia de la política monetaria: el banco central ajusta su tasa en respuesta a la inflación observada, al tiempo que busca moderarla en los meses siguientes. La distribución de la inflación mensual mostró cierta asimetría y una curtosis elevada, lo que sugiere la presencia de meses puntuales con variaciones de precios inusualmente altas, asociados a choques de oferta en rubros como alimentos y combustibles. En conjunto, los resultados indican que el tipo de cambio responde principalmente a condiciones externas, mientras que la dinámica de precios internos guarda una relación más estrecha con las decisiones del BCRP, quedando como línea futura de investigación un análisis causal más riguroso mediante modelos de series de tiempo multivariados, como un VAR con pruebas de causalidad de Granger.
